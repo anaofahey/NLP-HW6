@@ -135,8 +135,9 @@ class HiddenMarkovModel(nn.Module):
         """Set the transition and emission matrices A and B, based on the current parameters.
         See the "Parametrization" section of the reading handout."""
         
-        A = F.softmax(self._WA, dim=1)       # run softmax on params to get transition distributions
+        A = F.softmax(self._WA, dim=1)      # run softmax on params to get transition distributions
                                              # note that the BOS_TAG column will be 0, but each row will sum to 1
+        self.logA = F.log_softmax(self._WA, dim=1)
         if self.unigram:
             # A is a row vector giving unigram probabilities p(t).
             # We'll just set the bigram matrix to use these as p(t | s)
@@ -155,7 +156,11 @@ class HiddenMarkovModel(nn.Module):
         self.B[self.eos_t, :] = 0        # but don't guess: EOS_TAG can't emit any column's word (only EOS_WORD)
         self.B[self.bos_t, :] = 0        # same for BOS_TAG (although BOS_TAG will already be ruled out by other factors)
 
-
+        logB = F.log_softmax(WB, dim=1)
+        self.logB = logB.clone()
+        self.logB[self.eos_t, :] = -inf        # but don't guess: EOS_TAG can't emit any column's word (only EOS_WORD)
+        self.logB[self.bos_t, :] = -inf
+        
     def printAB(self) -> None:
         """Print the A and B matrices in a more human-readable format (tab-separated)."""
         print("Transition matrix A:")
@@ -180,7 +185,8 @@ class HiddenMarkovModel(nn.Module):
 
         When the logging level is set to DEBUG, the alpha and beta vectors and posterior counts
         are logged.  You can check this against the ice cream spreadsheet."""
-        return self.log_forward(sentence, corpus)
+        return self.log_forward_testing(sentence, corpus)
+        #return self.log_forward(sentence, corpus)
 
     def log_forward(self, sentence: Sentence, corpus: TaggedCorpus) -> Tensor:
         """Run the forward algorithm from the handout on a tagged, untagged, 
@@ -192,6 +198,10 @@ class HiddenMarkovModel(nn.Module):
         integerizing correctly."""
 
         sent = self._integerize_sentence(sentence, corpus)
+        print(sent)
+
+        print(self.logA)
+        print(self.logB)
 
         # The "nice" way to construct alpha is by appending to a List[Tensor] at each
         # step.  But to better match the notation in the handout, we'll instead preallocate
@@ -199,30 +209,91 @@ class HiddenMarkovModel(nn.Module):
         #alpha = [torch.empty(self.k) for _ in sent]  
 
         path = [{}]
-        for t in range(len(corpus.tagset[:-2])): #handling 
-            #print(sent[1][0])
-            emission_prob = self.B[t, sent[1][0]]
-            transition_prob = self.A[t, -1]
-            path[0][corpus.tagset[t]] = {'prob': emission_prob * transition_prob}
+        for t in range(len(corpus.tagset[:-2])): #handling BOS
+            #print(corpus.tagset[t])
+            emission_prob = self.logB[t, sent[1][0]]
+            #print(emission_prob)
+            transition_prob = self.logA[-1, t]
+            #print(transition_prob)
+            path[0][corpus.tagset[t]] = {'prob': emission_prob + transition_prob}
+
+        for w_idx in range(2, len(sent) - 1): #looping over each word  
+            #print(sent[w_idx][0])
+            path.append({})  
+            for t_idx in range(len(corpus.tagset[:-2])): #looping over each tag for each word
+                emission_prob = self.logB[t_idx, sent[w_idx][0]]
+                cum_prob = torch.tensor(-inf)
+                for t_idx_2 in range(len(corpus.tagset[:-2])): #previous tags for each word
+                    curr_prob = emission_prob + self.logA[t_idx_2, t_idx] + path[w_idx - 2][corpus.tagset[t_idx_2]]['prob']
+                    cum_prob = torch.logaddexp(curr_prob, cum_prob)
+                path[w_idx-1][corpus.tagset[t_idx]] = {'prob': cum_prob, 'p': cum_prob.exp()}
+                #print(cum_prob)
+        
+        for e in path:
+            print(e)
+
+        #if current tag has a label, skip inner loop (no other current tags are possible)
+        #if prev tag has a label, just add probability for that tag, skip the other previous tag possibilities
+        
+        total_prob = torch.tensor(-inf)
+        for t in range(len(corpus.tagset[:-2])): #handling EOS
+            #emission_prob = torch.tensor(0)
+            transition_prob = self.logA[t, -2]
+            total_prob = torch.logaddexp(transition_prob + path[-1][corpus.tagset[t]]['prob'], total_prob)
+        
+        print('total prob')
+        print(total_prob)
+        print(total_prob.exp())
+        #return math.log(total_prob.item())
+    
+    def log_forward_testing(self, sentence: Sentence, corpus: TaggedCorpus) -> Tensor:
+        """Run the forward algorithm from the handout on a tagged, untagged, 
+        or partially tagged sentence.  Return log Z (the log of the forward 
+        probability).
+
+        The corpus from which this sentence was drawn is also passed in as an
+        argument, to help with integerization and check that we're 
+        integerizing correctly."""
+
+        sent = self._integerize_sentence(sentence, corpus)
+        print(sent)
+
+        # The "nice" way to construct alpha is by appending to a List[Tensor] at each
+        # step.  But to better match the notation in the handout, we'll instead preallocate
+        # a list of length n+2 so that we can assign directly to alpha[j].
+        #alpha = [torch.empty(self.k) for _ in sent]  
+
+        path = [{}]
+        for t in range(len(corpus.tagset[:-2])): #handling BOS
+            emission_prob = self.logB[t, sent[1][0]]
+            print('tag')
+            print(corpus.tagset[t])
+            print(emission_prob)
+            transition_prob = self.logA[t, -1]
+            print(transition_prob)
+            path[0][corpus.tagset[t]] = {'prob': emission_prob + transition_prob}
 
         for w_idx in range(2, len(sent) - 1): #looping over each word  
             path.append({})  
             for t_idx in range(len(corpus.tagset[:-2])): #looping over each tag for each word
-                emission_prob = self.B[t_idx, sent[w_idx][0]]
+                emission_prob = self.logB[t_idx, sent[w_idx][0]]
                 cum_prob = 0
-                for t_idx_2 in range(len(corpus.tagset[:-2])):
-                    curr_prob = emission_prob * self.A[t_idx, t_idx_2] * path[w_idx - 2][corpus.tagset[t_idx_2]]['prob']
+                for t_idx_2 in range(len(corpus.tagset[:-2])): #previous tags for each word
+                    curr_prob = emission_prob + self.logA[t_idx, t_idx_2] + path[w_idx - 2][corpus.tagset[t_idx_2]]['prob']
                     cum_prob += curr_prob
-                path[w_idx-1][corpus.tagset[t_idx]] = {'prob': cum_prob}
-                #print(cum_prob)
+                path[w_idx-1][corpus.tagset[t_idx]] = {'prob': cum_prob, 'p': cum_prob.exp()}
+                print(cum_prob)
+
+        #if current tag has a label, skip inner loop (no other current tags are possible)
+        #if prev tag has a label, just add probability for that tag, skip the other previous tag possibilities
 
         total_prob = 0
-        for t in range(len(corpus.tagset[:-2])):
+        for t in range(len(corpus.tagset[:-2])): #handling EOS
             emission_prob = 1
-            transition_prob = self.A[-2, t]
-            total_prob += transition_prob * path[-1][corpus.tagset[t]]['prob']
+            transition_prob = self.logA[-2, t]
+            total_prob += transition_prob + path[-1][corpus.tagset[t]]['prob']
         
-        return math.log(total_prob.item())
+        #return total_prob
 
     def viterbi_tagging(self, sentence: Sentence, corpus: TaggedCorpus) -> Sentence:
         """Find the most probable tagging for the given sentence, according to the
@@ -231,7 +302,7 @@ class HiddenMarkovModel(nn.Module):
         # Note: This code is mainly copied from the forward algorithm.
         # We just switch to using max, and follow backpointers.
         # I've continued to call the vector alpha rather than mu.
-        
+        """
         #print(sentence)
         n = len(sentence)
         #print(corpus.vocab)
@@ -275,6 +346,7 @@ class HiddenMarkovModel(nn.Module):
 
         #print(final_path)
         #print(path)
+        """
         self.log_forward(sentence, corpus)
         
     def train(self,
